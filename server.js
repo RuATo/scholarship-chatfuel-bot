@@ -14,7 +14,7 @@ const db = mysql.createConnection({
   host: process.env.DB_HOST || "localhost",
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASS || "Viha0701",
-  database: process.env.DB_NAME || "scholarship_conditions",
+  database: process.env.DB_NAME || "scholarships",
   connectTimeout: 60000,
   acquireTimeout: 60000,
   timeout: 60000,
@@ -34,44 +34,20 @@ function connectWithRetry() {
 
 connectWithRetry();
 
-// Helper function: Convert JLPT level to number for comparison
-function jlptToNumber(level) {
-  const levels = { N5: 1, N4: 2, N3: 3, N2: 4, N1: 5 };
-  return levels[level] || 0;
-}
-
-// Helper function: Convert EJU score string to number
-function ejuScoreToNumber(scoreStr) {
-  if (!scoreStr || scoreStr === "none") return 0;
-
-  const scoreMap = {
-    "700+": 700,
-    "650+": 650,
-    "600+": 600,
-    "550+": 550,
-    "500+": 500,
-    below_500: 400,
-  };
-
-  return scoreMap[scoreStr] || 0;
-}
-
 // Main API endpoint cho Chatfuel
 app.post("/scholarships", (req, res) => {
   console.log("📨 Nhận request từ Chatfuel:", req.body);
 
   const {
-    user_status,
-    jlpt_level,
-    eju_score,
-    education,
-    age_range,
-    financial_need,
-    exam_status,
+    eligible_location,
+    jlpt_min_level, // user's JLPT (e.g. "N2")
+    eju_min_total, // user's EJU (e.g. "600" or "600+")
+    education_min, // user's education (e.g. "high_school_graduate")
+    age_max, // user's age (e.g. "21")
   } = req.body;
 
   // Validate dữ liệu đầu vào
-  if (!user_status || user_status === "unknown") {
+  if (!eligible_location || eligible_location === "unknown") {
     return res.json({
       messages: [
         {
@@ -86,44 +62,40 @@ app.post("/scholarships", (req, res) => {
   let queryParams = [];
 
   // 1. Lọc theo vị trí địa lý
-  if (user_status === "vietnam") {
+  if (eligible_location && eligible_location !== "none") {
     whereConditions.push(
-      "(eligible_location = ? OR eligible_location = ? OR eligible_location IS NULL)"
+      "(eligible_location = ? OR eligible_location = 'any' OR eligible_location IS NULL)"
     );
-    queryParams.push("vietnam", "any");
-  } else if (
-    user_status === "japan_language" ||
-    user_status === "japan_university"
-  ) {
-    whereConditions.push(
-      "(eligible_location = ? OR eligible_location = ? OR eligible_location IS NULL)"
-    );
-    queryParams.push("japan", "any");
-  } else if (user_status === "government") {
-    whereConditions.push(
-      "(eligible_location = ? OR eligible_location = ? OR target_group LIKE ?)"
-    );
-    queryParams.push("vietnam", "any", "%government%");
+    queryParams.push(eligible_location);
   }
 
-  // 2. Lọc theo JLPT level
-  if (jlpt_level && jlpt_level !== "none") {
-    const userJlptNumber = jlptToNumber(jlpt_level);
-    whereConditions.push(`(jlpt_min_level IS NULL OR 
-      CASE jlpt_min_level 
-        WHEN 'N5' THEN 1 
-        WHEN 'N4' THEN 2 
-        WHEN 'N3' THEN 3 
-        WHEN 'N2' THEN 4 
-        WHEN 'N1' THEN 5 
-        ELSE 0 
-      END <= ?)`);
-    queryParams.push(userJlptNumber);
+  // Helper trong JS (nếu muốn convert user level to number)
+  function jlptToNumber(level) {
+    const map = { N5: 1, N4: 2, N3: 3, N2: 4, N1: 5 };
+    return map[level] || 0;
+  }
+
+  // 2. Lọc theo JLPT (cho phép user có level cao hơn pož yêu cầu)
+  if (jlpt_min_level && jlpt_min_level !== "none") {
+    const userJlptNum = jlptToNumber(jlpt_min_level);
+    if (userJlptNum > 0) {
+      whereConditions.push(`(
+      jlpt_min_level IS NULL OR
+      CASE jlpt_min_level
+        WHEN 'N5' THEN 1
+        WHEN 'N4' THEN 2
+        WHEN 'N3' THEN 3
+        WHEN 'N2' THEN 4
+        WHEN 'N1' THEN 5
+        ELSE 0
+      END <= ?
+    )`);
+      queryParams.push(userJlptNum);
+    }
   }
 
   // 3. Lọc theo EJU score
-  if (eju_score && eju_score !== "none") {
-    const userEjuScore = ejuScoreToNumber(eju_score);
+  if (eju_min_total && eju_min_total !== "none") {
     if (userEjuScore > 0) {
       whereConditions.push("(eju_min_total IS NULL OR eju_min_total <= ?)");
       queryParams.push(userEjuScore);
@@ -131,46 +103,15 @@ app.post("/scholarships", (req, res) => {
   }
 
   // 4. Lọc theo trình độ học vấn
-  if (education && education !== "unknown") {
-    if (
-      education === "high_school_current" ||
-      education === "high_school_graduate"
-    ) {
-      whereConditions.push(
-        "(target_group LIKE '%high school%' OR target_group LIKE '%undergraduate%' OR target_group IS NULL)"
-      );
-    } else if (
-      education === "university_current" ||
-      education === "university_graduate"
-    ) {
-      whereConditions.push(
-        "(target_group LIKE '%undergraduate%' OR target_group LIKE '%graduate%' OR target_group IS NULL)"
-      );
-    } else if (education === "master_plus") {
-      whereConditions.push(
-        "(target_group LIKE '%graduate%' OR target_group LIKE '%postgraduate%' OR target_group IS NULL)"
-      );
-    }
+  if (education_min && education_min !== "none") {
+    whereConditions.push("(education_min IS NULL OR education_min = ?)");
+    queryParams.push(education_min);
   }
 
-  // 5. Lọc theo nhu cầu tài chính
-  if (financial_need === "full" || financial_need === "special") {
-    whereConditions.push(
-      '(monthly_stipend_yen_min > 100000 OR tuition_coverage = "full")'
-    );
-  } else if (financial_need === "partial") {
-    whereConditions.push(
-      '(monthly_stipend_yen_min > 50000 OR tuition_coverage IN ("partial", "full"))'
-    );
-  }
-
-  // 6. Lọc theo tuổi (nếu có yêu cầu cụ thể)
-  if (age_range && age_range !== "unknown") {
-    // Hầu hết học bổng không có giới hạn tuổi nghiêm ngặt
-    // Chỉ loại bỏ những cái có yêu cầu quá khắt khe
-    if (age_range === "over_35") {
-      whereConditions.push("(age_limit IS NULL OR age_limit >= 35)");
-    }
+  // 5. Lọc theo tuổi
+  if (age_max && age_max !== "none") {
+    whereConditions.push("(age_max IS NULL OR age_max >= ?)");
+    queryParams.push(Number(age_max));
   }
 
   // Tạo câu query hoàn chỉnh
@@ -226,9 +167,17 @@ app.post("/scholarships", (req, res) => {
             text: `😔 Hiện tại chưa có học bổng hoàn toàn phù hợp với điều kiện của bạn.
 
 💡 **Gợi ý cải thiện:**
-${jlpt_level === "none" || !jlpt_level ? "• Hãy thi JLPT (ít nhất N3)" : ""}
-${eju_score === "none" || !eju_score ? "• Thi EJU để có thêm cơ hội" : ""}
-${eju_score === "below_500" ? "• Cải thiện điểm EJU lên trên 550+" : ""}
+${
+  jlpt_min_level === "none" || !jlpt_min_level
+    ? "• Hãy thi JLPT (ít nhất N3)"
+    : ""
+}
+${
+  eju_min_total === "none" || !eju_min_total
+    ? "• Thi EJU để có thêm cơ hội"
+    : ""
+}
+${eju_min_total === "500" ? "• Cải thiện điểm EJU lên trên 550+" : ""}
 
 🔄 Hãy cập nhật thông tin và thử lại sau!`,
           },

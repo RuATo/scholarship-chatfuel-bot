@@ -13,7 +13,7 @@ app.use(express.json());
 function createDatabaseConfig() {
   if (process.env.DATABASE_URL) {
     // Parse DATABASE_URL: mysql://user:pass@host:port/database
-    const url = new URL(process.env.DATABASE_URL);
+    const url = new URL(process.env.mysql://root:OjpGMNFrqNcvAirdacMUROPhDKZVuUBc@caboose.proxy.rlwy.net:26637/railway);
     return {
       host: url.hostname,
       user: url.username,
@@ -437,3 +437,4 @@ app.listen(PORT, async () => {
   // Test database connection on startup
   await connectWithRetry();
 });
+

@@ -9,47 +9,78 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Parse DATABASE_URL từ Railway
+// BƯỚC 1: Cải thiện hàm createDatabaseConfig để hỗ trợ private network
 function createDatabaseConfig() {
-  if (process.env.DATABASE_URL) {
-    // Parse DATABASE_URL: mysql://user:pass@host:port/database
-   const url = new URL(process.env.DATABASE_URL);
+  // Debug environment variables
+  console.log("🔍 Available Environment Variables:");
+  console.log("DATABASE_URL:", process.env.DATABASE_URL ? "SET" : "NOT SET");
+  console.log("MYSQL_URL:", process.env.MYSQL_URL ? "SET" : "NOT SET");
+  console.log("MYSQL_PRIVATE_URL:", process.env.MYSQL_PRIVATE_URL ? "SET" : "NOT SET");
+  console.log("DATABASE_PRIVATE_URL:", process.env.DATABASE_PRIVATE_URL ? "SET" : "NOT SET");
+  
+  // Ưu tiên sử dụng private URLs để tránh egress fees
+  const databaseUrl = process.env.MYSQL_PRIVATE_URL || 
+                     process.env.DATABASE_PRIVATE_URL || 
+                     process.env.DATABASE_URL ||
+                     process.env.MYSQL_URL;
+
+  if (databaseUrl) {
+    console.log("🔗 Using DATABASE_URL:", databaseUrl.replace(/:[^:]*@/, ':****@')); // Hide password
+    
+    const url = new URL(databaseUrl);
+    
+    // Railway private network thường không cần SSL
+    const needSSL = url.hostname.includes('.railway.app') && !url.hostname.includes('.railway.internal');
+    
     return {
       host: url.hostname,
       user: url.username,
       password: url.password,
       database: url.pathname.substring(1), // Remove leading '/'
       port: parseInt(url.port) || 3306,
-      ssl: { rejectUnauthorized: false }, // Railway cần SSL
-      connectTimeout: 60000,
-      acquireTimeout: 60000,
-      timeout: 60000,
+      ssl: needSSL ? { rejectUnauthorized: false } : false,
+      connectTimeout: 30000, // Giảm timeout
+      acquireTimeout: 30000,
+      timeout: 30000,
       reconnect: true,
-      idleTimeout: 300000,
-      connectionLimit: 10,
+      connectionLimit: 5, // Giảm connection pool
       queueLimit: 0
     };
   } else {
     // Fallback to individual environment variables
+    console.log("🔗 Using individual environment variables");
+    console.log("MYSQL_HOST:", process.env.MYSQL_HOST);
+    console.log("MYSQL_PORT:", process.env.MYSQL_PORT);
+    console.log("DB_HOST:", process.env.DB_HOST);
+    
     return {
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASS || process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      port: process.env.DB_PORT || 3306,
-      ssl: { rejectUnauthorized: false },
-      connectTimeout: 60000,
-      acquireTimeout: 60000,
-      timeout: 60000,
+      host: process.env.MYSQL_HOST || process.env.DB_HOST,
+      user: process.env.MYSQL_USER || process.env.DB_USER,
+      password: process.env.MYSQL_PASSWORD || process.env.DB_PASS || process.env.DB_PASSWORD,
+      database: process.env.MYSQL_DATABASE || process.env.DB_NAME,
+      port: parseInt(process.env.MYSQL_PORT || process.env.DB_PORT) || 3306,
+      ssl: false, // Private network không cần SSL
+      connectTimeout: 30000,
+      acquireTimeout: 30000,
+      timeout: 30000,
       reconnect: true,
-      idleTimeout: 300000,
-      connectionLimit: 10,
+      connectionLimit: 5,
       queueLimit: 0
     };
   }
 }
 
 const dbConfig = createDatabaseConfig();
+
+// Validate config before creating pool
+if (!dbConfig.host || !dbConfig.user || !dbConfig.database) {
+  console.error("❌ Missing required database configuration:");
+  console.error("Host:", dbConfig.host || "MISSING");
+  console.error("User:", dbConfig.user || "MISSING");
+  console.error("Database:", dbConfig.database || "MISSING");
+  process.exit(1);
+}
+
 const pool = mysql.createPool(dbConfig);
 
 console.log("🔧 Database config:", {
@@ -60,36 +91,80 @@ console.log("🔧 Database config:", {
   ssl: !!dbConfig.ssl
 });
 
-// Test connection function
+// BƯỚC 2: Cải thiện test connection function với better error handling
 async function testConnection() {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    console.log(`🔄 Attempting to connect to ${dbConfig.host}:${dbConfig.port}...`);
+    
+    connection = await pool.getConnection();
+    
+    // Test với simple query
+    const [rows] = await connection.execute('SELECT 1 as test');
+    
     console.log("✅ Database connected successfully!");
     console.log(`🔗 Connected to: ${dbConfig.host}:${dbConfig.port}/${dbConfig.database}`);
-    connection.release();
+    
     return true;
   } catch (error) {
-    console.error("❌ Database connection failed:", error.message);
+    console.error("❌ Database connection failed:");
+    console.error("Error code:", error.code);
+    console.error("Error message:", error.message);
+    console.error("Error errno:", error.errno);
     console.error("🔧 Config used:", {
       host: dbConfig.host,
       user: dbConfig.user,
       database: dbConfig.database,
-      port: dbConfig.port
+      port: dbConfig.port,
+      ssl: !!dbConfig.ssl
     });
+    
+    // Detailed error analysis
+    if (error.code === 'ECONNREFUSED') {
+      console.error("🚨 Connection refused - possible causes:");
+      console.error("  1. Database service not running");
+      console.error("  2. Wrong host/port configuration");
+      console.error("  3. Firewall blocking connection");
+      console.error("  4. Using public URL instead of private network");
+    } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
+      console.error("🚨 Access denied - check username/password");
+    } else if (error.code === 'ENOTFOUND') {
+      console.error("🚨 Host not found - check hostname");
+    }
+    
     return false;
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 }
 
-// Test connection on startup với retry
-async function connectWithRetry(retries = 5) {
+// BƯỚC 3: Improved connection retry with exponential backoff
+async function connectWithRetry(retries = 10) {
   for (let i = 0; i < retries; i++) {
-    const success = await testConnection();
-    if (success) return;
+    console.log(`🔄 Connection attempt ${i + 1}/${retries}`);
     
-    console.log(`🔄 Retry ${i + 1}/${retries} after 5 seconds...`);
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    const success = await testConnection();
+    if (success) {
+      console.log("🎉 Database connection established!");
+      return true;
+    }
+    
+    if (i < retries - 1) {
+      const delay = Math.min(1000 * Math.pow(2, i), 30000); // Exponential backoff, max 30s
+      console.log(`⏳ Retry in ${delay/1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
   }
+  
   console.error("💥 Failed to connect after all retries");
+  console.error("🔧 Please check:");
+  console.error("  1. Railway MySQL service is running");
+  console.error("  2. Environment variables are set correctly");
+  console.error("  3. Using private network URL (MYSQL_PRIVATE_URL)");
+  
+  return false;
 }
 
 // Helper function để execute query an toàn
@@ -100,10 +175,14 @@ async function executeQuery(query, params = []) {
     const [results] = await connection.execute(query, params);
     return results;
   } catch (error) {
-    console.error("Query error:", error);
+    console.error("❌ Query error:", error.message);
+    console.error("🔍 Query:", query);
+    console.error("📋 Params:", params);
     throw error;
   } finally {
-    if (connection) connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 }
 
@@ -314,7 +393,7 @@ ${scholarship.special_notes ? `💡 **Lưu ý:** ${scholarship.special_notes}\n\
   }
 });
 
-// Health check endpoint
+// Health check endpoint - Enhanced with better DB testing
 app.get("/", async (req, res) => {
   try {
     // Test database connection
@@ -328,7 +407,8 @@ app.get("/", async (req, res) => {
       config: {
         host: dbConfig.host,
         database: dbConfig.database,
-        port: dbConfig.port
+        port: dbConfig.port,
+        ssl: !!dbConfig.ssl
       },
       endpoints: {
         main: "POST /scholarships",
@@ -341,7 +421,13 @@ app.get("/", async (req, res) => {
       status: "error",
       message: "❌ Database connection failed",
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      troubleshooting: {
+        step1: "Check if MySQL service is running on Railway",
+        step2: "Verify environment variables are set",
+        step3: "Use MYSQL_PRIVATE_URL for private network",
+        step4: "Check Railway project networking settings"
+      }
     });
   }
 });
@@ -377,17 +463,27 @@ app.get("/test", async (req, res) => {
       config_used: {
         host: dbConfig.host,
         database: dbConfig.database,
-        port: dbConfig.port
+        port: dbConfig.port,
+        ssl: !!dbConfig.ssl
       }
     });
   }
 });
 
-// Debug endpoint - chỉ dùng khi cần debug
+// Enhanced debug endpoint
 app.get("/debug", (req, res) => {
   res.json({
     environment_variables: {
       DATABASE_URL: process.env.DATABASE_URL ? "✅ Set" : "❌ Not set",
+      MYSQL_URL: process.env.MYSQL_URL ? "✅ Set" : "❌ Not set",
+      MYSQL_PRIVATE_URL: process.env.MYSQL_PRIVATE_URL ? "✅ Set" : "❌ Not set",
+      DATABASE_PRIVATE_URL: process.env.DATABASE_PRIVATE_URL ? "✅ Set" : "❌ Not set",
+      MYSQL_HOST: process.env.MYSQL_HOST || "Not set",
+      MYSQL_USER: process.env.MYSQL_USER || "Not set", 
+      MYSQL_DATABASE: process.env.MYSQL_DATABASE || "Not set",
+      MYSQL_PORT: process.env.MYSQL_PORT || "Not set",
+      MYSQL_PASSWORD: process.env.MYSQL_PASSWORD ? "✅ Set" : "❌ Not set",
+      // Legacy variables
       DB_HOST: process.env.DB_HOST || "Not set",
       DB_USER: process.env.DB_USER || "Not set", 
       DB_NAME: process.env.DB_NAME || "Not set",
@@ -401,6 +497,11 @@ app.get("/debug", (req, res) => {
       database: dbConfig.database,
       port: dbConfig.port,
       ssl: !!dbConfig.ssl
+    },
+    recommendations: {
+      "Use Private Network": "Set MYSQL_PRIVATE_URL to avoid egress fees",
+      "Check Service": "Ensure MySQL service is running in Railway",
+      "Verify Network": "Both services should be in same Railway project"
     }
   });
 });
@@ -408,8 +509,12 @@ app.get("/debug", (req, res) => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('🔄 SIGTERM received, closing database connections...');
-  await pool.end();
-  console.log('✅ Database connections closed');
+  try {
+    await pool.end();
+    console.log('✅ Database connections closed');
+  } catch (error) {
+    console.error('❌ Error closing database connections:', error);
+  }
   process.exit(0);
 });
 
@@ -435,7 +540,10 @@ app.listen(PORT, async () => {
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
   
   // Test database connection on startup
-  await connectWithRetry();
+  const connected = await connectWithRetry();
+  
+  if (!connected) {
+    console.error("❌ Server started but database connection failed");
+    console.error("🔧 Server will continue running but API calls may fail");
+  }
 });
-
-

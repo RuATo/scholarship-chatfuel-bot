@@ -9,16 +9,17 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database connection với error handling tốt
+//Connect with mysql on railway.com
 const db = mysql.createConnection({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASS || "Viha0701",
-  database: process.env.DB_NAME || "scholarships",
+  host: "caboose.proxy.rlwy.net", // Lấy host từ MYSQL_URL
+  user: "root", // Tên người dùng
+  password: "OjpGMNFrqNcvAirdacMUROPhDKZVuBc", // Mật khẩu
+  database: "railway", // Tên database
+  port: 26637, // Cổng từ MYSQL_URL
   connectTimeout: 60000,
   acquireTimeout: 60000,
-  timeout: 60000,
 });
+
 
 // Test connection with retry
 function connectWithRetry() {
@@ -325,3 +326,4 @@ app.listen(PORT, () => {
     }`
   );
 });
+

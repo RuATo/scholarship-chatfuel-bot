@@ -97,7 +97,7 @@ app.post("/scholarships", (req, res) => {
 
   // 3. Lọc theo EJU score
   if (eju_min_total && eju_min_total !== "none") {
-    if (userEjuScore > 0) {
+    if (eju_min_total > 0) {
       whereConditions.push("(eju_min_total IS NULL OR eju_min_total <= ?)");
       queryParams.push(userEjuScore);
     }
@@ -326,4 +326,5 @@ app.listen(PORT, () => {
     }`
   );
 });
+
 

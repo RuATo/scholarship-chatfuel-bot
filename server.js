@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const mysql = require("mysql2");
 const cors = require("cors");
@@ -9,322 +10,143 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-//Connect with mysql on railway.com
-const db = mysql.createConnection({
-  host: "caboose.proxy.rlwy.net", // Lấy host từ MYSQL_URL
-  user: "root", // Tên người dùng
-  password: "OjpGMNFrqNcvAirdacMUROPhDKZVuBc", // Mật khẩu
-  database: "railway", // Tên database
-  port: 26637, // Cổng từ MYSQL_URL
-  connectTimeout: 60000,
-  acquireTimeout: 60000,
+// Kết nối MySQL bằng connection pool
+const db = mysql.createPool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
 });
 
-
-// Test connection with retry
-function connectWithRetry() {
-  db.connect((err) => {
-    if (err) {
-      console.log("Lỗi kết nối database, thử lại sau 5s:", err.message);
-      setTimeout(connectWithRetry, 5000);
-    } else {
-      console.log("✅ Kết nối database thành công!");
-    }
-  });
-}
-
-connectWithRetry();
-
-// Main API endpoint cho Chatfuel
-app.post("/scholarships", (req, res) => {
-  console.log("📨 Nhận request từ Chatfuel:", req.body);
-
-  const {
-    eligible_location,
-    jlpt_min_level, // user's JLPT (e.g. "N2")
-    eju_min_total, // user's EJU (e.g. "600" or "600+")
-    education_min, // user's education (e.g. "high_school_graduate")
-    age_max, // user's age (e.g. "21")
-  } = req.body;
-
-  // Validate dữ liệu đầu vào
-  if (!eligible_location || eligible_location === "unknown") {
-    return res.json({
-      messages: [
-        {
-          text: "❌ Thiếu thông tin cơ bản. Vui lòng bắt đầu lại cuộc trò chuyện!",
-        },
-      ],
-    });
+// Test kết nối
+db.getConnection((err, connection) => {
+  if (err) {
+    console.error("❌ Lỗi kết nối MySQL:", err.message);
+  } else {
+    console.log("✅ Kết nối MySQL thành công!");
+    connection.release();
   }
+});
 
-  // Xây dựng điều kiện query
-  let whereConditions = [];
-  let queryParams = [];
+// Route gốc
+app.get("/", (req, res) => {
+  res.json({ message: "Server đang chạy!" });
+});
 
-  // 1. Lọc theo vị trí địa lý
-  if (eligible_location && eligible_location !== "none") {
-    whereConditions.push(
-      "(eligible_location = ? OR eligible_location = 'any' OR eligible_location IS NULL)"
-    );
-    queryParams.push(eligible_location);
-  }
+// Route lấy danh sách học bổng (lọc theo điều kiện)
+app.get("/hocbong", (req, res) => {
+  const { eligible_location, age, jlpt_min_level, eju_score, education_min } =
+    req.query;
 
-  // Helper trong JS (nếu muốn convert user level to number)
-  function jlptToNumber(level) {
-    const map = { N5: 1, N4: 2, N3: 3, N2: 4, N1: 5 };
-    return map[level] || 0;
-  }
-
-  // 2. Lọc theo JLPT (cho phép user có level cao hơn pož yêu cầu)
-  if (jlpt_min_level && jlpt_min_level !== "none") {
-    const userJlptNum = jlptToNumber(jlpt_min_level);
-    if (userJlptNum > 0) {
-      whereConditions.push(`(
-      jlpt_min_level IS NULL OR
-      CASE jlpt_min_level
-        WHEN 'N5' THEN 1
-        WHEN 'N4' THEN 2
-        WHEN 'N3' THEN 3
-        WHEN 'N2' THEN 4
-        WHEN 'N1' THEN 5
-        ELSE 0
-      END <= ?
-    )`);
-      queryParams.push(userJlptNum);
-    }
-  }
-
-  // 3. Lọc theo EJU score
-  if (eju_min_total && eju_min_total !== "none") {
-    if (eju_min_total > 0) {
-      whereConditions.push("(eju_min_total IS NULL OR eju_min_total <= ?)");
-      queryParams.push(userEjuScore);
-    }
-  }
-
-  // 4. Lọc theo trình độ học vấn
-  if (education_min && education_min !== "none") {
-    whereConditions.push("(education_min IS NULL OR education_min = ?)");
-    queryParams.push(education_min);
-  }
-
-  // 5. Lọc theo tuổi
-  if (age_max && age_max !== "none") {
-    whereConditions.push("(age_max IS NULL OR age_max >= ?)");
-    queryParams.push(Number(age_max));
-  }
-
-  // Tạo câu query hoàn chỉnh
   let query = `
     SELECT 
-      scholarship_no,
-      scholarship_name,
-      monthly_stipend_yen_min,
-      monthly_stipend_yen_max,
-      tuition_coverage,
-      application_window,
-      interview_required,
-      docs_required_core,
-      official_link,
-      special_notes,
-      jlpt_min_level,
-      eju_min_total
-    FROM scholarship_conditions
+    s.No AS ma_hoc_bong,
+      s.scholarship_name AS ten_hoc_bong,
+      c.eligible_location AS khu_vuc_ung_tuyen,
+      c.age_max AS do_tuoi_toi_da,
+      c.jlpt_min_level AS trinh_do_tieng_nhat_toi_thieu,
+      c.eju_min_total AS diem_eju_toi_thieu,
+      c.education_min AS trinh_do_hoc_van_toi_thieu,
+      s.Monthly_Amount AS tro_cap_hang_thang,
+  c.application_window AS thoi_gian_tuyen,
+      s.Reference_link AS duong_dan_chinh_thuc,
+      c.docs_required_core AS giay_to_bat_buoc,
+      s.Notes AS ghi_chu
+   FROM scholarships s
+JOIN scholarship_conditions c ON s.No = c.scholarship_no
   `;
 
-  if (whereConditions.length > 0) {
-    query += " WHERE " + whereConditions.join(" AND ");
+  const params = [];
+
+  if (eligible_location) {
+    if (eligible_location === "vietnam" || eligible_location === "japan") {
+      query += " AND c.eligible_location = ?";
+      params.push(eligible_location);
+    } else {
+      query += " AND c.eligible_location NOT IN ('vietnam', 'japan')";
+    }
   }
 
-  // Sắp xếp theo mức hỗ trợ tài chính (ưu tiên cao nhất trước)
-  query += ` 
-    ORDER BY 
-      monthly_stipend_yen_min DESC,
-      CASE tuition_coverage WHEN 'full' THEN 3 WHEN 'partial' THEN 2 ELSE 1 END DESC
-    LIMIT 5
-  `;
+  if (age) {
+    query += " AND c.age_max >= ?";
+    params.push(age);
+  }
 
-  console.log("🔍 Query:", query);
-  console.log("📋 Params:", queryParams);
+  if (jlpt_min_level) {
+    const jlptMap = {
+      N1: ["N1", "N2", "N3", "N4", "N5"],
+      N2: ["N2", "N3", "N4", "N5"],
+      N3: ["N3", "N4", "N5"],
+      N4: ["N4", "N5"],
+      N5: ["N5"],
+    };
 
-  // Thực hiện query
-  db.query(query, queryParams, (err, results) => {
-    if (err) {
-      console.error("❌ Database Error:", err);
-      return res.json({
-        messages: [
-          { text: "⚠️ Có lỗi xảy ra khi tìm kiếm. Vui lòng thử lại sau!" },
-        ],
-      });
+    const allowedLevels = jlptMap[jlpt_min_level] || [];
+    if (allowedLevels.length > 0) {
+      const placeholders = allowedLevels.map(() => "?").join(",");
+      query += ` AND (c.jlpt_min_level IN (${placeholders}) OR c.jlpt_min_level IS NULL)`;
+      params.push(...allowedLevels);
     }
+  }
 
-    console.log(`✅ Tìm thấy ${results.length} học bổng`);
+  if (eju_score) {
+    query += " AND c.eju_min_total <= ?";
+    params.push(eju_score);
+  }
+
+  if (education_min) {
+    query += " AND c.education_min = ?";
+    params.push(education_min);
+  }
+
+  db.query(query, params, (err, results) => {
+    if (err) {
+      console.error("❌ Lỗi truy vấn MySQL:", err.message);
+      return res
+        .status(500)
+        .json({ error: "Lỗi server, vui lòng thử lại sau." });
+    }
 
     if (results.length === 0) {
       return res.json({
-        messages: [
-          {
-            text: `😔 Hiện tại chưa có học bổng hoàn toàn phù hợp với điều kiện của bạn.
-
-💡 **Gợi ý cải thiện:**
-${
-  jlpt_min_level === "none" || !jlpt_min_level
-    ? "• Hãy thi JLPT (ít nhất N3)"
-    : ""
-}
-${
-  eju_min_total === "none" || !eju_min_total
-    ? "• Thi EJU để có thêm cơ hội"
-    : ""
-}
-${eju_min_total === "500" ? "• Cải thiện điểm EJU lên trên 550+" : ""}
-
-🔄 Hãy cập nhật thông tin và thử lại sau!`,
-          },
-        ],
+        message: "Không tìm thấy học bổng phù hợp với điều kiện bạn nhập.",
       });
     }
 
-    // Format kết quả cho Chatfuel
-    const messages = [];
-
-    // Message đầu tiên: Thông báo tìm thấy
-    messages.push({
-      text: `🎉 **Tìm thấy ${results.length} học bổng phù hợp!**\n\n📋 Dưới đây là các học bổng được sắp xếp theo mức độ ưu tiên:`,
+    // 🌸 Format kết quả rõ ràng, có nguồn bảng
+    const formatted = results.map((row, index) => {
+      return `#${index + 1} 🎓 ${row.ten_hoc_bong}
+📍 Khu vực (c.eligible_location): ${row.khu_vuc_ung_tuyen || "Không rõ"}
+🧒 Độ tuổi tối đa (c.age_max): ${row.do_tuoi_toi_da || "Không giới hạn"}
+💬 JLPT yêu cầu (c.jlpt_min_level): ${
+        row.trinh_do_tieng_nhat_toi_thieu || "Không yêu cầu"
+      }
+📊 Điểm EJU tối thiểu (c.eju_min_total): ${row.diem_eju_toi_thieu || 0}
+🎓 Trình độ học vấn (c.education_min): ${
+        row.trinh_do_hoc_van_toi_thieu || "Không rõ"
+      }
+💴 Trợ cấp (s.Monthly_Amount): ${row.tro_cap_hang_thang || "Không có thông tin"}
+🕒 Thời gian tuyển (c.application_window): ${row.thoi_gian_tuyen || "Không rõ"}
+🔗 Link chính thức (s.Reference_link): ${row.duong_dan_chinh_thuc || "Không có"}
+📄 Giấy tờ bắt buộc (c.docs_required_core): ${
+        row.giay_to_bat_buoc || "Không có thông tin"
+      }
+📝 Ghi chú (s.Notes): ${row.ghi_chu || "Không có"}
+──────────────────────────────`;
     });
 
-    // Các message tiếp theo: Chi tiết từng học bổng
-    results.forEach((scholarship, index) => {
-      let stipendInfo = "";
-
-      if (scholarship.monthly_stipend_yen_min > 0) {
-        const min = scholarship.monthly_stipend_yen_min.toLocaleString();
-        const max =
-          scholarship.monthly_stipend_yen_max >
-          scholarship.monthly_stipend_yen_min
-            ? scholarship.monthly_stipend_yen_max.toLocaleString()
-            : min;
-        stipendInfo = `💰 **${min}${max !== min ? `-${max}` : ""}** yen/tháng`;
-      }
-
-      let tuitionInfo = "";
-      if (scholarship.tuition_coverage === "full") {
-        tuitionInfo = "\n🎓 **Miễn phí** học phí";
-      } else if (scholarship.tuition_coverage === "partial") {
-        tuitionInfo = "\n🎓 **Hỗ trợ một phần** học phí";
-      }
-
-      let requirementInfo = "";
-      if (scholarship.jlpt_min_level) {
-        requirementInfo += `\n📝 JLPT: **${scholarship.jlpt_min_level}** trở lên`;
-      }
-      if (scholarship.eju_min_total > 0) {
-        requirementInfo += `\n📊 EJU: **${scholarship.eju_min_total}+** điểm`;
-      }
-
-      const messageText = `**${index + 1}. ${
-        scholarship.scholarship_name ||
-        `Học bổng số ${scholarship.scholarship_no}`
-      }**
-
-${stipendInfo}${tuitionInfo}
-⏰ **Đăng ký:** ${scholarship.application_window || "Liên hệ để biết thêm"}
-${
-  scholarship.interview_required === "yes"
-    ? "🎤 **Có** phỏng vấn"
-    : "✅ **Không** cần phỏng vấn"
-}${requirementInfo}
-
-📋 **Hồ sơ cần:** ${scholarship.docs_required_core || "Xem chi tiết tại link"}
-
-${
-  scholarship.special_notes
-    ? `💡 **Lưu ý:** ${scholarship.special_notes}\n\n`
-    : ""
-}🔗 **Chi tiết:** ${scholarship.official_link || "Liên hệ để biết thêm"}
-
----`;
-
-      messages.push({ text: messageText });
+    // 🌈 Trả về JSON đẹp
+    res.json({
+      tong_so_ket_qua: results.length,
+      ket_qua_tim_thay: formatted,
     });
-
-    // Message cuối: Call to action
-    messages.push({
-      text: `✨ **Bước tiếp theo:**
-
-1️⃣ Đọc kỹ yêu cầu của từng học bổng
-2️⃣ Chuẩn bị hồ sơ theo danh sách
-3️⃣ Nộp đơn trước deadline
-4️⃣ Theo dõi email để biết kết quả
-
-🍀 **Chúc bạn thành công!**
-
-💬 Nhắn **"help"** nếu cần hỗ trợ thêm!`,
-    });
-
-    res.json({ messages });
-  });
-});
-
-// Test endpoint để kiểm tra server
-app.get("/", (req, res) => {
-  res.json({
-    status: "success",
-    message: "Server đang hoạt động! Sẵn sàng nhận request từ Chatfuel.",
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      main: "POST /scholarships",
-      test: "GET /test",
-      health: "GET /",
-    },
-  });
-});
-
-// Test endpoint với dữ liệu mẫu
-app.get("/test", (req, res) => {
-  const testData = {
-    user_status: "vietnam",
-    jlpt_level: "N2",
-    eju_score: "600+",
-    education: "high_school_graduate",
-    age_range: "20_25",
-    financial_need: "full",
-    exam_status: "both",
-  };
-
-  res.json({
-    message: "Test data sẵn sàng",
-    sample_request: testData,
-    instructions: "POST dữ liệu này đến /scholarships để test",
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error("💥 Server Error:", err);
-  res.status(500).json({
-    messages: [{ text: "⚠️ Có lỗi server. Vui lòng thử lại sau!" }],
-  });
-});
-
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Endpoint không tồn tại",
-    available_endpoints: ["GET /", "GET /test", "POST /scholarships"],
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server đang chạy tại port ${PORT}`);
-  console.log(
-    `🌐 URL: ${
-      process.env.NODE_ENV === "production"
-        ? "https://your-app.herokuapp.com"
-        : `http://localhost:${PORT}`
-    }`
-  );
+  console.log(`🚀 Server chạy tại http://localhost:${PORT}`);
 });
-
-
